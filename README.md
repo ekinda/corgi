@@ -1,4 +1,4 @@
-#Corgi
+# Corgi
 
 Corgi is a deep neural network that predicts genomic sequencing tracks such as DNase-seq, ATAC-seq, histone ChIP-seq, CTCF binding and DNA methylation.
 

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from modules import FiLM, FiLM_MLP, TargetLengthCrop, ConvBlock, TransformerBlock
+
+from .modules import FiLM, FiLM_MLP, TargetLengthCrop, ConvBlock, TransformerBlock
 
 class Corgi(nn.Module):
     def __init__(self, config):
@@ -119,11 +120,10 @@ class Corgi(nn.Module):
         x = self.transformer_layers[8](x)
         return x
     
-    def forward(self, x, tf_exp):
-        film_params_conv = self.film_mlp_conv(tf_exp)
+    def forward(self, x, trans_reg):
+        film_params_conv = self.film_mlp_conv(trans_reg)
         film_scales_conv, film_shifts_conv = self._split_film_params(film_params_conv, self.config['film_dimensions_conv'])
-
-        film_params_tr = self.film_mlp_transformer(tf_exp)
+        film_params_tr = self.film_mlp_transformer(trans_reg)
         film_scales_tr, film_shifts_tr = self._split_film_params(film_params_tr, self.config['film_dimensions_transformer'])
 
         x = x.permute(0,2,1)                                                # (batch, 4, 524288)

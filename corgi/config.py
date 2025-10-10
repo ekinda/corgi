@@ -1,13 +1,23 @@
+from pathlib import Path
+
+
+_BASE_DIR = Path(__file__).resolve().parents[1]
+_DATA_DIR = _BASE_DIR / "data"
+_MODEL_DIR = _BASE_DIR / "models" / "corgi"
+
+
 config_corgi = {
-    "dna_path": "data/dna_onehot.npy",
-    "bed_path": "data/hg38_sequence_folds_tfexcluded34.bed",
-    "data_dir": "data/",
-    "mask_path": "data/experiment_mask.npy",
-    "tf_exp_path": "data/tf_expression.npy",
-    "experiments_path": "data/experiments_final.txt",
-    "tissue_clusters_path": "data/tissue_clustering.csv",
-    "model_output_path": "models/corgi/",
-    "gnomad_pickle": "data/gnomad_dictionary.pk",
+    "dna_path": str(_DATA_DIR / "dna_onehot.npy"),
+    "bed_path": str(_DATA_DIR / "hg38_sequence_folds_tfexcluded34.bed"),
+    "data_dir": str(_DATA_DIR),
+    "mask_path": str(_DATA_DIR / "experiment_mask.npy"),
+    "trans_regulator_expression_path": str(_DATA_DIR / "tf_expression.npy"),
+    "trans_regulator_symbols_path": str(_DATA_DIR / "trans_regulators_final_hgnc.txt"),
+    "trans_regulator_ensembl_path": str(_DATA_DIR / "trans_regulators_final_ensg.txt"),
+    "experiments_path": str(_DATA_DIR / "experiments_final.txt"),
+    "tissue_clusters_path": str(_DATA_DIR / "tissue_clustering.csv"),
+    "model_output_path": str(_MODEL_DIR),
+    "gnomad_pickle": str(_DATA_DIR / "gnomad_dictionary.pk"),
     
     "seed": 1,
     "batch_size": 2,

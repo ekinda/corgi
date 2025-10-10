@@ -5,7 +5,7 @@ import numpy as np
 import os
 import math
 import pickle
-from utils import one_hot_to_base, base_to_one_hot
+from .utils import one_hot_to_base, base_to_one_hot
 
 class CorgiSampler(Sampler):
     def __init__(self, sequence_ids, tissue_ids, shuffled=False):
@@ -106,22 +106,22 @@ class CorgiDataset(Dataset):
         tissue_dir: str,
         tissue_ids: list,
         experiment_mask: dict,
-        tf_expression: torch.Tensor,
+        trans_reg_expression: torch.Tensor,
         output_channels: int,
         augment_dna: bool = False,
         augment_gnomad: bool = False,
-        augment_tf_std: float = 0,
+        augment_trans_reg_std: float = 0,
         gnomad_pickle: str = None,
-        tf_exp_clip: tuple = None
+        trans_reg_clip: tuple = None
     ):
         super().__init__()
         self.sequence_ids = sequence_ids
         self.dna_sequences = np.load(dna_sequences, mmap_mode='r')  # shape: (num_seqs, 524288, 4)
         self.tissue_ids = tissue_ids
-        self.tf_expression = tf_expression  # shape: (n_tissues, 2891)
+        self.trans_reg_expression = trans_reg_expression  # shape: (n_tissues, n_trans_regulators)
         self.augment_dna = augment_dna
         self.augment_gnomad = augment_gnomad
-        self.augment_tf_std = augment_tf_std
+        self.augment_trans_reg_std = augment_trans_reg_std
         self.experiment_mask = experiment_mask  # dict: {tissue_id: array([...])} arrays are length 22
         self.output_channels = output_channels
 
@@ -142,10 +142,10 @@ class CorgiDataset(Dataset):
             key: torch.as_tensor(val).unsqueeze(-1)
             for key, val in self.experiment_mask.items()
         }
-        # Optionally clip TF expression values at min and max values.
-        if tf_exp_clip is not None:
-            tf_exp_clip_min, tf_exp_clip_max = tf_exp_clip
-            self.tf_expression = torch.clamp(self.tf_expression, min=tf_exp_clip_min, max=tf_exp_clip_max)
+        # Optionally clip trans regulator expression values at min and max values.
+        if trans_reg_clip is not None:
+            clip_min, clip_max = trans_reg_clip
+            self.trans_reg_expression = torch.clamp(self.trans_reg_expression, min=clip_min, max=clip_max)
 
         # Optionally load and prepare the gnomAD augmentations
         self.gnomad_augmentations = {}
@@ -231,7 +231,7 @@ class CorgiDataset(Dataset):
             index_tuple (int, int): (sequence_index, tissue_id).
         Returns:
             dna_seq (Tensor) shape (524288, 4)
-            tf_exp  (Tensor) shape (2865,)
+            trans_reg (Tensor) shape (n_trans_regulators,)
             padded_label (Tensor) shape (output_channels, 8192)
             exp_mask (Tensor) shape (output_channels, 1)
 
@@ -240,7 +240,7 @@ class CorgiDataset(Dataset):
         seq_id, tissue_id = index_tuple
 
         dna_seq = torch.from_numpy(self.dna_sequences[seq_id]).clone()  # shape: (524288, 4)
-        tf_exp = self.tf_expression[tissue_id]
+        trans_reg = self.trans_reg_expression[tissue_id]
         label = self.all_labels[tissue_id][seq_id]  # shape: (8192, n_available_tracks)
         exp_mask = self.experiment_mask_torch[tissue_id]  # shape: (output_channels, 1)
 
@@ -262,10 +262,10 @@ class CorgiDataset(Dataset):
                 dna_seq = self.dna_rc(dna_seq)
                 reverse_aug = True
 
-        # TF expression augmentation
-        if self.augment_tf_std:
-            noise = torch.rand_like(tf_exp) * self.augment_tf_std
-            tf_exp = tf_exp + noise
+        # Trans regulator expression augmentation
+        if self.augment_trans_reg_std:
+            noise = torch.rand_like(trans_reg) * self.augment_trans_reg_std
+            trans_reg = trans_reg + noise
 
         # Padding label, flipping if rc
         label = torch.from_numpy(label)
@@ -277,7 +277,7 @@ class CorgiDataset(Dataset):
             padded_label = torch.flip(padded_label, dims=[0])
             padded_label = padded_label[:, self.rc_flipped_strands]
 
-        return dna_seq.type(torch.float16), tf_exp, padded_label.permute(1,0), exp_mask
+        return dna_seq.type(torch.float16), trans_reg, padded_label.permute(1,0), exp_mask
 
     def get_item(self, seq_id, tissue_id):
         return self.__getitem__((seq_id, tissue_id))

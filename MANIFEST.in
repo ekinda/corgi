@@ -1,0 +1,3 @@
+include README.md
+include data/trans_regulators_final_hgnc.txt
+include data/trans_regulators_final_ensg.txt

@@ -13,9 +13,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
-from models import Corgi
-from data_classes import CorgiDataset, CorgiDistributedSampler
-from utils import load_experiment_mask, poisson_multinomial_masked_v2
+from .model import Corgi
+from .data_classes import CorgiDataset, CorgiDistributedSampler
+from .utils import load_experiment_mask, poisson_multinomial_masked_v2
 
 class CorgiBaseTrainer:
     def __init__(self, config):
@@ -106,7 +106,7 @@ class CorgiBaseTrainer:
         # Load genome data and auxiliary files.
         self.dna_path = cfg["dna_path"]
         self.experiment_mask = load_experiment_mask(cfg["mask_path"])
-        self.tf_exp = torch.from_numpy(np.load(cfg["tf_exp_path"])).float()
+        self.trans_reg_expression = torch.from_numpy(np.load(cfg["trans_regulator_expression_path"])).float()
             
     def _build_optimizer_scheduler(self):
         """
@@ -223,13 +223,13 @@ class CorgiTrainer(CorgiBaseTrainer):
             tissue_dir=cfg["data_dir"],
             tissue_ids=self.train_tissues,
             experiment_mask=self.experiment_mask,
-            tf_expression=self.tf_exp,
+            trans_reg_expression=self.trans_reg_expression,
             output_channels=cfg["output_channels"],
             augment_dna=True,
             augment_gnomad=True,
-            augment_tf_std=0.02,
+            augment_trans_reg_std=0.02,
             gnomad_pickle=cfg["gnomad_pickle"],
-            tf_exp_clip=None
+            trans_reg_clip=None
         )
         sampler = CorgiDistributedSampler(
             sequence_ids=self.train_seq_idx,
@@ -255,15 +255,15 @@ class CorgiTrainer(CorgiBaseTrainer):
             sampler.set_epoch(epoch)
             
             for batch in train_loader:
-                dna_seq, tf_exp, label, exp_mask = batch
+                dna_seq, trans_reg, label, exp_mask = batch
                 dna_seq = dna_seq.to(self.local_rank, non_blocking=True)
-                tf_exp = tf_exp.to(self.local_rank, non_blocking=True)
+                trans_reg = trans_reg.to(self.local_rank, non_blocking=True)
                 label = label.to(self.local_rank, non_blocking=True)
                 exp_mask = exp_mask.to(self.local_rank, non_blocking=True)
 
                 self.optimizer.zero_grad()
                 with torch.autocast('cuda', dtype=torch.bfloat16):
-                    outputs = self.model(dna_seq, tf_exp)
+                    outputs = self.model(dna_seq, trans_reg)
                     cropped_label = self.crop_tensor(label, self.config["output_central_bins"])
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, exp_mask, poisson_loss_weight, loss_epsilon)
                     weights = (1 / (2 * self.model.module.loss_channel_weights ** 2))  # shape: (22,)

@@ -1,5 +1,5 @@
-from trainer import CorgiTrainer
-from config import config_corgi
+from .trainer import CorgiTrainer
+from .config import config_corgi
 import logging
 import torch.distributed as dist
 

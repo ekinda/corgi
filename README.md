@@ -6,6 +6,7 @@ See the following preprint for details:
 
 https://www.biorxiv.org/content/10.1101/2025.06.25.661447v1
 
+Model weights can be downloaded from: https://zenodo.org/records/17368602
 
 ## Tutorial
 

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional
 
 from .modules import FiLM, FiLM_MLP, TargetLengthCrop, ConvBlock, TransformerBlock
 
@@ -130,6 +131,142 @@ class Corgi(nn.Module):
         x = self.convolutions(x, film_scales_conv, film_shifts_conv)
         x = x.permute(0,2,1)                                                # (batch, 8192, 1536)
         x = self.transformers(x, film_scales_tr, film_shifts_tr)
+        x = x.permute(0,2,1)                                                # (batch, 1536, 8192)
+        x = self.crop(x)    
+        x = self.final_conv(x)
+        x = self.output_head(x)
+        x = self.softplus(x)
+        return x                                                            # (batch, output_channels [22], target_length [6144])
+
+
+class CorgiPlus(Corgi):
+    """Extension of Corgi that can condition on auxiliary genomic tracks (RNA-seq or DNase).
+
+    Modes
+    -----
+    - "rna": expects trans-regulator vector (as in Corgi) and an auxiliary local track of shape (B, L, 2)
+      corresponding to RNA total plus/minus. FiLM conditioning uses trans_reg.
+    - "dnase": expects a global DNase embedding vector (e.g., 8277-dim hv_marker_embeddings_z) and a local
+      DNase track (B, L, 1). FiLM conditioning uses the DNase embedding instead of trans_reg.
+
+    Config extensions (needed in config)
+    - corgiplus_aux_input_dim
+    - corgiplus_aux_hidden_dim (default 128)
+    - corgiplus_aux_out_dim (default 256)
+    - corgiplus_aux_dropout (default 0.1)
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.aux_in = config.get('corgiplus_aux_input_dim', 2)
+        self.aux_hidden = config.get('corgiplus_aux_hidden_dim', 128)
+        self.aux_out = config.get('corgiplus_aux_out_dim', 256)
+        self.aux_dropout = config.get('corgiplus_aux_dropout', 0.1)
+
+        self.aux_encoder = nn.Sequential(
+            nn.Conv1d(in_channels = self.aux_in, out_channels = self.aux_hidden,  kernel_size = 1),
+            ConvBlock(in_channels = self.aux_hidden,  out_channels = self.aux_out, kernel_size = 1)
+        )
+
+        self.dna_aux_concat_project = nn.Sequential(
+            nn.Linear(config['dim'] + self.aux_out, config['dim']),
+            nn.LayerNorm(config['dim']),
+            nn.GELU(approximate='tanh')
+        )
+
+    def forward(self, x, aux, trans_reg):
+        film_params_conv = self.film_mlp_conv(trans_reg)
+        film_scales_conv, film_shifts_conv = self._split_film_params(film_params_conv, self.config['film_dimensions_conv'])
+        film_params_tr = self.film_mlp_transformer(trans_reg)
+        film_scales_tr, film_shifts_tr = self._split_film_params(film_params_tr, self.config['film_dimensions_transformer'])
+
+        x = x.permute(0,2,1)                                                # (batch, 4, 524288)
+        x = self.convolutions(x, film_scales_conv, film_shifts_conv)
+        x = x.permute(0,2,1)                                                # (batch, 8192, 1536)
+        aux = aux.permute(0,2,1)                                            # (batch, aux_channels, 8192)
+        aux = self.aux_encoder(aux)                                         # (batch, aux_out_dim, 8192)
+
+        aux = aux.permute(0,2,1)                                            # (batch, 8192, aux_out_dim)
+
+        x = self.dna_aux_concat_project(torch.cat([x, aux], dim=-1))        # (batch, 8192, 1536)
+
+        x = self.transformers(x, film_scales_tr, film_shifts_tr)
+        x = x.permute(0,2,1)                                                # (batch, 1536, 8192)
+        x = self.crop(x)    
+        x = self.final_conv(x)
+        x = self.output_head(x)
+        x = self.softplus(x)
+        return x                                                            # (batch, output_channels [22], target_length [6144])
+    
+class CorgiPlusNofilm(Corgi):
+    """
+    CorgiPlus variant without FiLM conditioning, for ablation studies.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.aux_in = config.get('corgiplus_aux_input_dim', 2)
+        self.aux_hidden = config.get('corgiplus_aux_hidden_dim', 128)
+        self.aux_out = config.get('corgiplus_aux_out_dim', 256)
+        self.aux_dropout = config.get('corgiplus_aux_dropout', 0.1)
+
+        self.aux_encoder = nn.Sequential(
+            nn.Conv1d(in_channels = self.aux_in, out_channels = self.aux_hidden,  kernel_size = 1),
+            ConvBlock(in_channels = self.aux_hidden,  out_channels = self.aux_out, kernel_size = 1)
+        )
+
+        self.dna_aux_concat_project = nn.Sequential(
+            nn.Linear(config['dim'] + self.aux_out, config['dim']),
+            nn.LayerNorm(config['dim']),
+            nn.GELU(approximate='tanh')
+        )
+
+        self.film_mlp_conv = None
+        self.film_mlp_transformer = None
+        self.film_layers = None
+        self.all_film_dimensions = None
+
+    def convolutions(self, x):
+        x = self.conv_0(x)
+        x = self.max_pool(x)
+        x = self.conv_1(x)
+        x = self.max_pool(x)
+        x = self.conv_2(x)
+        x = self.max_pool(x)
+        x = self.conv_3(x)
+        x = self.max_pool(x)
+        x = self.conv_4(x)
+        x = self.max_pool(x)
+        x = self.conv_5(x)
+        x = self.max_pool(x)
+        return x
+    
+    def transformers(self, x):
+        x = self.transformer_layers[0](x)
+        x = self.transformer_layers[1](x)
+        x = self.transformer_layers[2](x)
+        x = self.transformer_layers[3](x)
+        x = self.transformer_layers[4](x)
+        x = self.transformer_layers[5](x)
+        x = self.transformer_layers[6](x)
+        x = self.transformer_layers[7](x)
+        x = self.transformer_layers[8](x)
+        return x
+
+    def forward(self, x, aux, trans_reg):
+        x = x.permute(0,2,1)                                                # (batch, 4, 524288)
+        x = self.convolutions(x)
+        x = x.permute(0,2,1)                                                # (batch, 8192, 1536)
+        aux = aux.permute(0,2,1)                                            # (batch, aux_channels, 8192)
+        aux = self.aux_encoder(aux)                                         # (batch, aux_out_dim, 8192)
+
+        aux = aux.permute(0,2,1)                                            # (batch, 8192, aux_out_dim)
+
+        x = self.dna_aux_concat_project(torch.cat([x, aux], dim=-1))        # (batch, 8192, 1536)
+
+        x = self.transformers(x)
         x = x.permute(0,2,1)                                                # (batch, 1536, 8192)
         x = self.crop(x)    
         x = self.final_conv(x)

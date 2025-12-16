@@ -145,6 +145,25 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         main_scheduler = CosineAnnealingLR(self.optimizer, T_max=max(1, total_steps - cfg['warmup_steps']), eta_min=0.0)
         self.scheduler = SequentialLR(self.optimizer, [warmup_scheduler, main_scheduler], [cfg['warmup_steps']])
 
+    def save_checkpoint(self, epoch):
+        """
+        Saves a checkpoint with model, optimizer, scaler, and scheduler states.
+        """
+        if self.rank == 0:
+            cfg = self.config
+            model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
+            timestamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
+            checkpoint_path = os.path.join(cfg["model_output_path"], f"corgiplus_{self.mode}_epoch_{epoch}_{timestamp}.pt")
+
+            torch.save({
+                "model_state_dict": model_to_save.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "epoch": epoch,
+                "global_step": self.global_step
+            }, checkpoint_path)
+            logging.info(f"Checkpoint saved to {checkpoint_path}.")
+
     def train(self):
         cfg = self.config
         loss_epsilon = cfg['loss_epsilon']

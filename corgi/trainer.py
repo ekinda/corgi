@@ -5,6 +5,7 @@ import psutil
 import logging
 import numpy as np
 import pandas as pd
+from contextlib import nullcontext
 from socket import gethostname
 
 import torch
@@ -18,11 +19,12 @@ from .data_classes import CorgiDataset, CorgiDistributedSampler
 from .utils import load_experiment_mask, poisson_multinomial_masked_v2
 
 class CorgiBaseTrainer:
-    def __init__(self, config):
+    def __init__(self, config, training_mode: str = "slurm"):
         """
         Initializes the trainer with the given configuration.
         """
         self.config = config
+        self.training_mode = training_mode
         self.global_step = 0
         self.start_epoch = 0
         self.start_time = time.time()
@@ -57,6 +59,18 @@ class CorgiBaseTrainer:
         self.seed = seed
 
     def _init_ddp(self):
+        if self.training_mode == "local":
+            self.rank = 0
+            self.world_size = 1
+            self.gpus_per_node = torch.cuda.device_count()
+            self.local_rank = 0
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.local_rank)
+                self.device = torch.device("cuda", self.local_rank)
+            else:
+                raise NotImplementedError("CUDA not found. CPU support is not implemented. Exiting.")
+            return
+
         self.rank          = int(os.environ["SLURM_PROCID"])
         self.world_size    = int(os.environ["WORLD_SIZE"])
         self.gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
@@ -187,8 +201,8 @@ class CorgiBaseTrainer:
             logging.info(f"Resumed from model checkpoint at {checkpoint_path}")
 
 class CorgiTrainer(CorgiBaseTrainer):
-    def __init__(self, config):
-        super(CorgiTrainer, self).__init__(config)
+    def __init__(self, config, training_mode: str = "slurm"):
+        super(CorgiTrainer, self).__init__(config, training_mode=training_mode)
 
         self._init_ddp()
         self._set_seed(self.config["seed"])
@@ -200,7 +214,10 @@ class CorgiTrainer(CorgiBaseTrainer):
         model = Corgi(self.config)
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = model.to(self.local_rank)
-        model = DDP(model, device_ids = [self.local_rank])
+
+        if self.training_mode == "slurm":
+            model = DDP(model, device_ids=[self.local_rank])
+
         self.model = model
 
         if self.rank == 0:

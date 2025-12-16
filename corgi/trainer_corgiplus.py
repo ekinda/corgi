@@ -38,9 +38,9 @@ def _load_ids(path: str) -> List[int]:
 class CorgiPlusTrainer(CorgiBaseTrainer):
     """DDP trainer for CorgiPlus and fine-tuning variants."""
 
-    def __init__(self, config, mode: str = 'rna'):
+    def __init__(self, config, mode: str = 'rna', training_mode: str = 'slurm'):
         self.mode = mode
-        super().__init__(config)
+        super().__init__(config, training_mode=training_mode)
         self._init_ddp()
         self._set_seed(self.config["seed"])
         self._prepare_data()
@@ -113,7 +113,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = model.to(self.local_rank)
-        model = DDP(model, device_ids=[self.local_rank])
+        if self.training_mode == 'slurm':
+            model = DDP(model, device_ids=[self.local_rank])
         self.model = model
 
         if self.rank == 0:
@@ -231,9 +232,11 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     cropped_label = self.crop_tensor(label, cfg["output_central_bins"])
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
 
-                    if hasattr(self.model.module, 'loss_channel_weights'):
-                        weights = (1 / (2 * self.model.module.loss_channel_weights ** 2))
-                        channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(self.model.module.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
+                    model_ref = self.model.module if isinstance(self.model, DDP) else self.model
+
+                    if hasattr(model_ref, 'loss_channel_weights'):
+                        weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
+                        channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(model_ref.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
                         loss = channel_losses.sum() / masked_exp.sum()
                     else:
                         loss = (channel_losses * masked_exp.squeeze(-1)).sum() / masked_exp.sum()

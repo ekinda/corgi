@@ -177,7 +177,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             timestamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
-            checkpoint_path = os.path.join(cfg["model_output_path"], f"cp_{self.mode}_gnomad_{augment_gnomad}_epoch_{epoch}_{timestamp}.pt")
+            checkpoint_path = os.path.join(cfg["model_output_path"], f"cp_{self.mode}_delta_{self.residual_training}_gnomad_{augment_gnomad}_epoch_{epoch}_{timestamp}.pt")
 
             torch.save({
                 "model_state_dict": model_to_save.state_dict(),

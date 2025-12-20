@@ -30,8 +30,10 @@ def compute_baseline(input_dir: Path, mask_path: Path, tissue_ids_path: Path, ou
     logging.info(f"Found {num_seqs} sequences, length {seq_len}, channels {avail_channels} in {first_file}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    baseline = np.memmap(output_path, mode='w+', dtype=dtype, shape=(num_seqs, seq_len, output_channels))
-    counts = np.memmap(output_path.with_suffix(output_path.suffix + '.counts.npy'), mode='w+', dtype='uint16', shape=(num_seqs, output_channels))
+    # Use open_memmap to create valid .npy files with headers (np.memmap alone writes raw binary).
+    baseline = np.lib.format.open_memmap(output_path, mode='w+', dtype=dtype, shape=(num_seqs, seq_len, output_channels))
+    counts_path = output_path.with_suffix(output_path.suffix + '.counts.npy')
+    counts = np.lib.format.open_memmap(counts_path, mode='w+', dtype='uint16', shape=(num_seqs, output_channels))
     baseline[:] = 0
     counts[:] = 0
 
@@ -60,9 +62,10 @@ def compute_baseline(input_dir: Path, mask_path: Path, tissue_ids_path: Path, ou
     denom = np.maximum(counts, 1)[:, None, :]
     baseline /= denom
 
-    baseline.flush()
-    counts.flush()
-    logging.info(f"Baseline saved to {output_path}")
+    baseline.flush(); counts.flush()
+    # Explicitly close memmaps
+    del baseline, counts
+    logging.info(f"Baseline saved to {output_path} and counts to {counts_path}")
 
 
 def main():

@@ -57,4 +57,5 @@ config_corgiplus = {
     'seed': 1,
     'model_output_path': str(_MODEL_DIR),
     'finetune_checkpoint': str(Path('/project/deeprna_data/corgi-reproduction/data/corgi_model.pt')),
+    'min_pred_value': 0.0,
 }

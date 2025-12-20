@@ -332,6 +332,9 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_batch = baseline_batch.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, cfg['output_central_bins'])
                         outputs = outputs + baseline_crop
+
+                    # Keep predictions positive to avoid log-domain NaNs when residuals go negative
+                    outputs = torch.clamp(outputs, min=cfg.get('min_pred_value', 1e-4))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
@@ -440,6 +443,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_batch = baseline_batch.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, self.config['output_central_bins'])
                         outputs = outputs + baseline_crop
+
+                    outputs = torch.clamp(outputs, min=self.config.get('min_pred_value', 1e-4))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])
@@ -451,8 +456,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     else:
                         channel_losses = channel_losses * masked_exp.squeeze(-1)
 
-                        loss_num = channel_losses.sum()
-                        loss_den = masked_exp.sum() + 1e-8
+                    loss_num = channel_losses.sum()
+                    loss_den = masked_exp.sum() + 1e-8
 
                     total_num += loss_num
                     total_den += loss_den

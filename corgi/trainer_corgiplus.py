@@ -20,7 +20,6 @@ from .utils import load_experiment_mask, poisson_multinomial_masked_v2
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 
-
 class CorgiPlusDataset(CorgiDataset):
     """Return tissue ids alongside tensors for DNase conditioning."""
 
@@ -98,7 +97,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             baseline_path = cfg.get('baseline_path')
             if not baseline_path or not Path(baseline_path).exists():
                 raise FileNotFoundError(f"Residual training enabled but baseline_path missing: {baseline_path}")
-            self.baseline = np.load(baseline_path, mmap_mode='r')
+            self.baseline = np.load(baseline_path, mmap_mode='r', allow_pickle=True)
 
         self.dnase_global = None
         if self.mode in ("dnase", "dnase_nofilm"):
@@ -119,12 +118,12 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             model = CorgiPlus(cfg)
         elif self.mode == 'dnase_nofilm':
             model = CorgiPlusNofilm(cfg)
-        elif self.mode in ('corgi_finetune_gnomad', 'corgi_finetune_nognomad'):
+        elif self.mode in ('corgi', 'corgi_finetune'):
             model = Corgi(cfg)
         else:
             raise ValueError(f"Unsupported mode {self.mode}")
 
-        if self.mode in ('corgi_finetune_gnomad', 'corgi_finetune_nognomad'):
+        if self.mode == 'corgi_finetune':
             ckpt_path = cfg.get('finetune_checkpoint')
             if ckpt_path and Path(ckpt_path).exists():
                 state = torch.load(ckpt_path, map_location='cpu')
@@ -134,6 +133,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     logging.info(f"Loaded checkpoint {ckpt_path}; missing={len(missing)}, unexpected={len(unexpected)}")
 
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
         model = model.to(self.local_rank)
         if self.training_mode == 'slurm':
             model = DDP(model, device_ids=[self.local_rank])
@@ -173,9 +173,11 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         """
         if self.rank == 0:
             cfg = self.config
+            augment_gnomad = str(int(cfg.get('augment_gnomad', False)))
+
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             timestamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
-            checkpoint_path = os.path.join(cfg["model_output_path"], f"corgiplus_{self.mode}_epoch_{epoch}_{timestamp}.pt")
+            checkpoint_path = os.path.join(cfg["model_output_path"], f"cp_{self.mode}_gnomad_{augment_gnomad}_epoch_{epoch}_{timestamp}.pt")
 
             torch.save({
                 "model_state_dict": model_to_save.state_dict(),
@@ -197,7 +199,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             poisson_loss_weight = 1.0
 
         augment_dna = cfg.get('augment_dna', True)
-        augment_gnomad = cfg.get('augment_gnomad', False) or self.mode == 'corgi_finetune_gnomad'
+        augment_gnomad = cfg.get('augment_gnomad', False)
         augment_tr_std = cfg.get('augment_trans_reg_std', 0.02)
 
         return_seq_id = self.residual_training
@@ -217,7 +219,6 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             trans_reg_clip=None,
             return_seq_id=return_seq_id
         )
-
         sampler = CorgiDistributedSampler(
             sequence_ids=self.train_seq_idx,
             tissue_ids=self.train_tissues,
@@ -303,7 +304,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
                     if self.mode == 'rna':
                         aux = label[:, 16:18, :]
-                        masked_exp[:, 16:18, :] = 0
+                        # Turn off backprop from RNA channels: total rna, polyA, scRNA
+                        masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase':
@@ -315,33 +317,33 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         aux = label[:, 0:1, :]
                         masked_exp[:, 0:1, :] = 0
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
-                    elif self.mode in ('corgi_finetune_gnomad', 'corgi_finetune_nognomad'):
+                    elif self.mode in ('corgi', 'corgi_finetune'):
                         outputs = self.model(dna_seq, trans_reg)
                     else:
                         raise ValueError(self.mode)
 
                     cropped_label = self.crop_tensor(label, cfg["output_central_bins"])
 
+                    # If predicting the residual, add the baseline signal across training tissues
                     if self.residual_training:
                         seq_np = seq_id.detach().cpu().numpy()
                         baseline_batch = torch.from_numpy(self.baseline[seq_np]).to(self.local_rank)
                         baseline_batch = baseline_batch.permute(0, 2, 1)  # (B, C, L)
                         baseline_batch = baseline_batch.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, cfg['output_central_bins'])
-                        pred_full = outputs + baseline_crop
-                        mse = (pred_full - cropped_label) ** 2
-                        loss = (mse * masked_exp).sum() / (masked_exp.sum() + 1e-8)
+                        outputs = outputs + baseline_crop
+                    
+                    # Compute loss
+                    channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
+
+                    # Adaptive loss
+                    model_ref = self.model.module if isinstance(self.model, DDP) else self.model
+                    if hasattr(model_ref, 'loss_channel_weights'):
+                        weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
+                        channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(model_ref.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
+                        loss = channel_losses.sum() / masked_exp.sum()
                     else:
-                        channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
-
-                        model_ref = self.model.module if isinstance(self.model, DDP) else self.model
-
-                        if hasattr(model_ref, 'loss_channel_weights'):
-                            weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
-                            channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(model_ref.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
-                            loss = channel_losses.sum() / masked_exp.sum()
-                        else:
-                            loss = (channel_losses * masked_exp.squeeze(-1)).sum() / masked_exp.sum()
+                        loss = (channel_losses * masked_exp.squeeze(-1)).sum() / masked_exp.sum()
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['gradient_clipping'])
@@ -424,7 +426,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         aux = label[:, 0:1, :]
                         masked_exp[:, 0:1, :] = 0
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
-                    elif self.mode in ('corgi_finetune_gnomad', 'corgi_finetune_nognomad'):
+                    elif self.mode in ('corgi', 'corgi_finetune'):
                         outputs = self.model(dna_seq, trans_reg)
                     else:
                         raise ValueError(self.mode)
@@ -437,20 +439,17 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_batch = baseline_batch.permute(0, 2, 1)
                         baseline_batch = baseline_batch.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, self.config['output_central_bins'])
-                        pred_full = outputs + baseline_crop
-                        mse = (pred_full - cropped_label) ** 2
-                        loss_num = (mse * masked_exp).sum()
-                        loss_den = masked_exp.sum() + 1e-8
+                        outputs = outputs + baseline_crop
+                    
+                    # Compute loss
+                    channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])
+
+                    model_ref = self.model.module if isinstance(self.model, DDP) else self.model
+                    if hasattr(model_ref, 'loss_channel_weights'):
+                        weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
+                        channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(model_ref.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
                     else:
-                        channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])
-
-                        model_ref = self.model.module if isinstance(self.model, DDP) else self.model
-
-                        if hasattr(model_ref, 'loss_channel_weights'):
-                            weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
-                            channel_losses = (channel_losses * weights.unsqueeze(0) + torch.log(model_ref.loss_channel_weights).unsqueeze(0)) * masked_exp.squeeze(-1)
-                        else:
-                            channel_losses = channel_losses * masked_exp.squeeze(-1)
+                        channel_losses = channel_losses * masked_exp.squeeze(-1)
 
                         loss_num = channel_losses.sum()
                         loss_den = masked_exp.sum() + 1e-8

@@ -59,8 +59,13 @@ class Corgi(nn.Module):
             nn.Dropout(0.1),
             nn.GELU(approximate='tanh'),
         )
-        self.output_head = nn.Conv1d(in_channels = 1920, out_channels = config['output_channels'], kernel_size = 1)
-        self.softplus = nn.Softplus()
+        if config.get('final_softplus', True):
+            self.output_head = nn.Sequential(
+                nn.Conv1d(in_channels = 1920, out_channels = config['output_channels'], kernel_size = 1),
+                nn.Softplus()
+            )
+        else:
+            self.output_head = nn.Conv1d(in_channels = 1920, out_channels = config['output_channels'], kernel_size = 1)
 
         if config['loss_style'] in ['adaptive_loss', 'adaptive_mn']:
             self.loss_channel_weights = torch.nn.Parameter(torch.ones(config['output_channels']))
@@ -135,7 +140,6 @@ class Corgi(nn.Module):
         x = self.crop(x)    
         x = self.final_conv(x)
         x = self.output_head(x)
-        x = self.softplus(x)
         return x                                                            # (batch, output_channels [22], target_length [6144])
 
 
@@ -196,7 +200,6 @@ class CorgiPlus(Corgi):
         x = self.crop(x)    
         x = self.final_conv(x)
         x = self.output_head(x)
-        x = self.softplus(x)
         return x                                                            # (batch, output_channels [22], target_length [6144])
     
 class CorgiPlusNofilm(Corgi):
@@ -271,5 +274,4 @@ class CorgiPlusNofilm(Corgi):
         x = self.crop(x)    
         x = self.final_conv(x)
         x = self.output_head(x)
-        x = self.softplus(x)
         return x                                                            # (batch, output_channels [22], target_length [6144])

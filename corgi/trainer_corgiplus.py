@@ -433,7 +433,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_crop = self.crop_tensor(baseline_batch, self.config['output_central_bins'])
                         outputs = outputs + baseline_crop
 
-                    outputs = torch.clamp(outputs, min=self.config.get('min_pred_value', 1e-4))
+                    outputs = torch.clamp(outputs, min=self.config.get('min_pred_value', 0.0))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])

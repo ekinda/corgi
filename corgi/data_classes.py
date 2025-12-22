@@ -112,7 +112,9 @@ class CorgiDataset(Dataset):
         augment_gnomad: bool = False,
         augment_trans_reg_std: float = 0,
         gnomad_pickle: str = None,
-        trans_reg_clip: tuple = None
+        trans_reg_clip: tuple = None,
+        return_mean_baseline: bool = False,
+        mean_baseline_file: str = None,
     ):
         super().__init__()
         self.sequence_ids = sequence_ids
@@ -159,6 +161,13 @@ class CorgiDataset(Dataset):
         self.rc_flipped_strands[14], self.rc_flipped_strands[15] = self.rc_flipped_strands[15], self.rc_flipped_strands[14]
         self.rc_flipped_strands[16], self.rc_flipped_strands[17] = self.rc_flipped_strands[17], self.rc_flipped_strands[16]
         self.rc_flipped_strands[18], self.rc_flipped_strands[19] = self.rc_flipped_strands[19], self.rc_flipped_strands[18]
+
+        self.return_mean_baseline = return_mean_baseline
+        if return_mean_baseline:
+            if mean_baseline_file is None or not os.path.isfile(mean_baseline_file):
+                raise ValueError("mean_baseline_file must be provided and exist if return_mean_baseline is True.")
+            mb = torch.from_numpy(np.load(mean_baseline_file))            # (n_seq, 8192, C)
+            self.mean_baseline = mb.permute(0, 2, 1).contiguous()         # (n_seq, C, 8192)
 
     def _build_gnomad_augmentations(self, pickle_path):
         """
@@ -277,7 +286,14 @@ class CorgiDataset(Dataset):
             padded_label = torch.flip(padded_label, dims=[0])
             padded_label = padded_label[:, self.rc_flipped_strands]
 
-        return dna_seq.type(torch.float16), trans_reg, padded_label.permute(1,0), exp_mask
+        if self.return_mean_baseline:
+            mean_baseline = self.mean_baseline[seq_id]  # shape: (C, 8192)
+            if reverse_aug:
+                mean_baseline = torch.flip(mean_baseline, dims=[-1])
+                mean_baseline = mean_baseline[self.rc_flipped_strands, :]
+            return dna_seq.type(torch.float16), trans_reg, padded_label.permute(1,0), exp_mask, mean_baseline
+        else:
+            return dna_seq.type(torch.float16), trans_reg, padded_label.permute(1,0), exp_mask
 
     def get_item(self, seq_id, tissue_id):
         return self.__getitem__((seq_id, tissue_id))

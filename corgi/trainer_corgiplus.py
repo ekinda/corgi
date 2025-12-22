@@ -23,17 +23,17 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 class CorgiPlusDataset(CorgiDataset):
     """Return tissue ids alongside tensors for DNase conditioning."""
 
-    def __init__(self, *args, return_seq_id: bool = False, **kwargs):
-        self.return_seq_id = return_seq_id
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def __getitem__(self, index_tuple):
-        dna_seq, trans_reg, padded_label, exp_mask = super().__getitem__(index_tuple)
         seq_id, tissue_id = index_tuple
-        if self.return_seq_id:
+        if self.return_mean_baseline:
+            dna_seq, trans_reg, padded_label, exp_mask, mean_baseline = super().__getitem__(index_tuple)
+            return dna_seq, trans_reg, padded_label, exp_mask, mean_baseline, tissue_id, seq_id
+        else:
+            dna_seq, trans_reg, padded_label, exp_mask = super().__getitem__(index_tuple)
             return dna_seq, trans_reg, padded_label, exp_mask, tissue_id, seq_id
-        return dna_seq, trans_reg, padded_label, exp_mask, tissue_id
-
 
 def _load_ids(path: str) -> List[int]:
     with open(path) as f:
@@ -92,12 +92,12 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         self.trans_reg_expression = torch.from_numpy(np.load(cfg["trans_regulator_expression_path"])).float()
 
         self.residual_training = cfg.get('residual_training', False)
-        self.baseline = None
+        self.mean_baseline_file = None
         if self.residual_training:
             baseline_path = cfg.get('baseline_path')
             if not baseline_path or not Path(baseline_path).exists():
                 raise FileNotFoundError(f"Residual training enabled but baseline_path missing: {baseline_path}")
-            self.baseline = np.load(baseline_path, mmap_mode='r', allow_pickle=True)
+            self.mean_baseline_file = baseline_path
 
         self.dnase_global = None
         if self.mode in ("dnase", "dnase_nofilm"):
@@ -202,7 +202,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         augment_gnomad = cfg.get('augment_gnomad', False)
         augment_tr_std = cfg.get('augment_trans_reg_std', 0.02)
 
-        return_seq_id = self.residual_training
+        return_mean_baseline = self.residual_training
 
         train_dataset = CorgiPlusDataset(
             dna_sequences=cfg['dna_path'],
@@ -217,7 +217,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             augment_trans_reg_std=augment_tr_std,
             gnomad_pickle=cfg.get('gnomad_pickle'),
             trans_reg_clip=None,
-            return_seq_id=return_seq_id
+            return_mean_baseline=return_mean_baseline,
+            mean_baseline_file=self.mean_baseline_file
         )
         sampler = CorgiDistributedSampler(
             sequence_ids=self.train_seq_idx,
@@ -227,7 +228,6 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             seed=self.seed,
             shuffled=True
         )
-
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg["batch_size"],
@@ -236,7 +236,6 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             persistent_workers=False,
             pin_memory=False
         )
-
         # Optional validation loader
         val_loader = None
         val_sampler = None
@@ -254,7 +253,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                 augment_trans_reg_std=0.0,
                 gnomad_pickle=None,
                 trans_reg_clip=None,
-                return_seq_id=return_seq_id
+                return_mean_baseline=return_mean_baseline,
+                mean_baseline_file=self.mean_baseline_file
             )
             val_sampler = CorgiDistributedSampler(
                 sequence_ids=self.valid_seq_idx,
@@ -285,23 +285,20 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
             for batch in train_loader:
                 if self.residual_training:
-                    dna_seq, trans_reg, label, exp_mask, tissue_id, seq_id = batch
+                    dna_seq, trans_reg, label, exp_mask, mean_baseline, tissue_id, seq_id = batch
+                    mean_baseline = mean_baseline.to(self.local_rank, non_blocking=True)
                 else:
-                    dna_seq, trans_reg, label, exp_mask, tissue_id = batch
-                    seq_id = None
+                    dna_seq, trans_reg, label, exp_mask, tissue_id, seq_id = batch
 
                 dna_seq = dna_seq.to(self.local_rank, non_blocking=True)
                 trans_reg = trans_reg.to(self.local_rank, non_blocking=True)
                 label = label.to(self.local_rank, non_blocking=True)
                 exp_mask = exp_mask.to(self.local_rank, non_blocking=True)
                 tissue_id = tissue_id.to(self.local_rank, non_blocking=True)
-                if seq_id is not None:
-                    seq_id = seq_id.to(self.local_rank, non_blocking=True)
 
                 self.optimizer.zero_grad()
                 with torch.autocast('cuda', dtype=torch.bfloat16):
                     masked_exp = exp_mask.clone()
-
                     if self.mode == 'rna':
                         aux = label[:, 16:18, :]
                         # Turn off backprop from RNA channels: total rna, polyA, scRNA
@@ -326,15 +323,12 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
                     # If predicting the residual, add the baseline signal across training tissues
                     if self.residual_training:
-                        seq_np = seq_id.detach().cpu().numpy()
-                        baseline_batch = torch.from_numpy(self.baseline[seq_np]).to(self.local_rank)
-                        baseline_batch = baseline_batch.permute(0, 2, 1)  # (B, C, L)
-                        baseline_batch = baseline_batch.to(outputs.dtype)
+                        baseline_batch = mean_baseline.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, cfg['output_central_bins'])
                         outputs = outputs + baseline_crop
 
                     # Keep predictions positive to avoid log-domain NaNs when residuals go negative
-                    outputs = torch.clamp(outputs, min=cfg.get('min_pred_value', 1e-4))
+                    outputs = torch.clamp(outputs, min=cfg.get('min_pred_value', 0.0))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
@@ -399,18 +393,16 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         with torch.no_grad():
             for batch in val_loader:
                 if self.residual_training:
-                    dna_seq, trans_reg, label, exp_mask, tissue_id, seq_id = batch
+                    dna_seq, trans_reg, label, exp_mask, mean_baseline, tissue_id, seq_id = batch
+                    mean_baseline = mean_baseline.to(self.local_rank, non_blocking=True)
                 else:
-                    dna_seq, trans_reg, label, exp_mask, tissue_id = batch
-                    seq_id = None
+                    dna_seq, trans_reg, label, exp_mask, tissue_id, seq_id = batch
 
                 dna_seq = dna_seq.to(self.local_rank, non_blocking=True)
                 trans_reg = trans_reg.to(self.local_rank, non_blocking=True)
                 label = label.to(self.local_rank, non_blocking=True)
                 exp_mask = exp_mask.to(self.local_rank, non_blocking=True)
                 tissue_id = tissue_id.to(self.local_rank, non_blocking=True)
-                if seq_id is not None:
-                    seq_id = seq_id.to(self.local_rank, non_blocking=True)
 
                 with torch.autocast('cuda', dtype=torch.bfloat16):
                     masked_exp = exp_mask.clone()
@@ -437,10 +429,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     cropped_label = self.crop_tensor(label, self.config["output_central_bins"])
 
                     if self.residual_training:
-                        seq_np = seq_id.detach().cpu().numpy()
-                        baseline_batch = torch.from_numpy(self.baseline[seq_np]).to(self.local_rank)
-                        baseline_batch = baseline_batch.permute(0, 2, 1)
-                        baseline_batch = baseline_batch.to(outputs.dtype)
+                        baseline_batch = mean_baseline.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, self.config['output_central_bins'])
                         outputs = outputs + baseline_crop
 

@@ -43,14 +43,18 @@ def _load_ids(path: str) -> List[int]:
 class CorgiPlusTrainer(CorgiBaseTrainer):
     """DDP trainer for CorgiPlus and fine-tuning variants."""
 
-    def __init__(self, config, mode: str = 'rna', training_mode: str = 'slurm'):
+    def __init__(self, config, mode: str = 'rna', training_mode: str = 'slurm', corgi_impute: bool = False):
         self.mode = mode
+        self.corgi_impute = corgi_impute
+        if self.corgi_impute:
+            logging.info(f"[init] Corgi imputation mode enabled.")
         super().__init__(config, training_mode=training_mode)
         self._init_ddp()
         self._set_seed(self.config["seed"])
         self._prepare_data()
         self._build_model()
         self._build_optimizer_scheduler()
+        self.best_val_loss = float('inf')
 
     @staticmethod
     def parse_bed_file(bed_path):
@@ -92,12 +96,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         self.trans_reg_expression = torch.from_numpy(np.load(cfg["trans_regulator_expression_path"])).float()
 
         self.residual_training = cfg.get('residual_training', False)
-        self.mean_baseline_file = None
-        if self.residual_training:
-            baseline_path = cfg.get('baseline_path')
-            if not baseline_path or not Path(baseline_path).exists():
-                raise FileNotFoundError(f"Residual training enabled but baseline_path missing: {baseline_path}")
-            self.mean_baseline_file = baseline_path
+        self.mean_baseline_file = cfg.get('baseline_path')
 
         self.dnase_global = None
         if self.mode in ("dnase", "dnase_nofilm"):
@@ -109,8 +108,18 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         if self.mode in ("dnase", "dnase_nofilm") and self.dnase_global is not None:
             cfg['input_trans_regulators'] = self.dnase_global.shape[1]
             cfg['corgiplus_aux_input_dim'] = 1
+            if self.corgi_impute:
+                cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
         elif self.mode == 'rna':
             cfg['corgiplus_aux_input_dim'] = 2
+            if self.corgi_impute:
+                cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
+
+        elif self.mode == 'corgiplus_impute':
+            cfg['corgiplus_aux_input_dim'] = cfg['output_channels']
+
+        if self.mode in ('dnase', 'dnase_nofilm', 'rna', 'corgiplus_impute'):
+            logging.info(f'Building CorgiPlus model for mode {self.mode} with aux input dim {cfg["corgiplus_aux_input_dim"]}')
 
         if self.mode == 'rna':
             model = CorgiPlus(cfg)
@@ -118,6 +127,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             model = CorgiPlus(cfg)
         elif self.mode == 'dnase_nofilm':
             model = CorgiPlusNofilm(cfg)
+        elif self.mode == 'corgiplus_impute':
+            model = CorgiPlus(cfg)
         elif self.mode in ('corgi', 'corgi_finetune'):
             model = Corgi(cfg)
         else:
@@ -173,7 +184,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         """
         if self.rank == 0:
             cfg = self.config
-            augment_gnomad = str(int(cfg.get('augment_gnomad', False)))
+            augment_gnomad = str(cfg.get('augment_gnomad', False))
 
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             timestamp = time.strftime('%Y-%m-%d_%H:%M', time.localtime())
@@ -192,6 +203,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         cfg = self.config
         loss_epsilon = cfg['loss_epsilon']
         should_stop = False
+        best_val_loss = self.best_val_loss
 
         if cfg['loss_style'] in ['adaptive_mn']:
             poisson_loss_weight = cfg['poisson_loss_weighting']
@@ -202,7 +214,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         augment_gnomad = cfg.get('augment_gnomad', False)
         augment_tr_std = cfg.get('augment_trans_reg_std', 0.02)
 
-        return_mean_baseline = self.residual_training
+        return_mean_baseline = True
 
         train_dataset = CorgiPlusDataset(
             dna_sequences=cfg['dna_path'],
@@ -275,6 +287,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         elif cfg.get('enable_val_during_train') and self.rank == 0:
             logging.warning("Validation requested but validation sequences or tissues are empty; skipping.")
 
+        val_enabled = cfg.get('enable_val_during_train') and val_loader is not None
+
         for epoch in range(self.start_epoch, cfg["epochs"]):
             if self.rank == 0:
                 logging.info(f"--- Epoch {epoch}/{cfg['epochs']} ---")
@@ -284,7 +298,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                 val_sampler.set_epoch(epoch)
 
             for batch in train_loader:
-                if self.residual_training:
+                if return_mean_baseline:
                     dna_seq, trans_reg, label, exp_mask, mean_baseline, tissue_id, seq_id = batch
                     mean_baseline = mean_baseline.to(self.local_rank, non_blocking=True)
                 else:
@@ -301,19 +315,29 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     masked_exp = exp_mask.clone()
                     if self.mode == 'rna':
                         aux = label[:, 16:18, :]
+                        # In the imputation mode, we use the mean baseline of all channels as additional aux input
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
                         # Turn off backprop from RNA channels: total rna, polyA, scRNA
                         masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase':
                         aux = label[:, 0:1, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
                         masked_exp[:, 0:1, :] = 0
                         cond = self.dnase_global[tissue_id]
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase_nofilm':
                         aux = label[:, 0:1, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
                         masked_exp[:, 0:1, :] = 0
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
+                    elif self.mode == 'corgiplus_impute':
+                        aux = mean_baseline
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg)
                     elif self.mode in ('corgi', 'corgi_finetune'):
                         outputs = self.model(dna_seq, trans_reg)
                     else:
@@ -326,9 +350,8 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_batch = mean_baseline.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, cfg['output_central_bins'])
                         outputs = outputs + baseline_crop
-
-                    # Keep predictions positive to avoid log-domain NaNs when residuals go negative
-                    outputs = torch.clamp(outputs, min=cfg.get('min_pred_value', 0.0))
+                        # Keep predictions positive to avoid log-domain NaNs when residuals go negative
+                        outputs = torch.clamp(outputs, min=cfg.get('min_pred_value', 0.0))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
@@ -358,17 +381,25 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
                 now = time.time()
                 if now + cfg['safety_margin'] >= self.start_time + cfg['max_runtime']:
-                    if cfg.get('enable_val_during_train'):
-                        self._run_validation(val_loader, val_sampler, epoch, step, tag="timeout")
-                    logging.info("Max runtime reached; checkpointing.")
-                    self.save_checkpoint(epoch)
+                    if val_enabled:
+                        val_loss = self._run_validation(val_loader, val_sampler, epoch, step, tag="timeout")
+                        if self.rank == 0 and val_loss is not None and val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            self.save_checkpoint(epoch)
+                    else:
+                        logging.info("Max runtime reached; checkpointing.")
+                        self.save_checkpoint(epoch)
                     should_stop = True
                     break
 
                 elif step > 0 and step % cfg['checkpoint_every_n'] == 0:
-                    if cfg.get('enable_val_during_train'):
-                        self._run_validation(val_loader, val_sampler, epoch, step, tag="step")
-                    self.save_checkpoint(epoch)
+                    if val_enabled:
+                        val_loss = self._run_validation(val_loader, val_sampler, epoch, step, tag="step")
+                        if self.rank == 0 and val_loss is not None and val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            self.save_checkpoint(epoch)
+                    else:
+                        self.save_checkpoint(epoch)
 
                 self.global_step += 1
                 step += 1
@@ -376,23 +407,30 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             if should_stop:
                 break
 
-            if cfg.get('enable_val_during_train'):
-                self._run_validation(val_loader, val_sampler, epoch, step, tag="epoch_end")
-            self.save_checkpoint(epoch)
+            if val_enabled:
+                val_loss = self._run_validation(val_loader, val_sampler, epoch, step, tag="epoch_end")
+                if self.rank == 0 and val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_checkpoint(epoch)
+            else:
+                self.save_checkpoint(epoch)
 
         logging.info("Training complete, exiting.")
+        self.best_val_loss = best_val_loss
 
     def _run_validation(self, val_loader, val_sampler, epoch: int, step: int, tag: str = "val"):
         if val_loader is None:
-            return
+            return None
 
         self.model.eval()
         total_num = torch.zeros(1, device=self.local_rank)
         total_den = torch.zeros(1, device=self.local_rank)
 
+        val_loss = None
+
         with torch.no_grad():
             for batch in val_loader:
-                if self.residual_training:
+                if True:
                     dna_seq, trans_reg, label, exp_mask, mean_baseline, tissue_id, seq_id = batch
                     mean_baseline = mean_baseline.to(self.local_rank, non_blocking=True)
                 else:
@@ -409,18 +447,27 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
                     if self.mode == 'rna':
                         aux = label[:, 16:18, :]
-                        masked_exp[:, 16:18, :] = 0
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
+                        masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase':
                         aux = label[:, 0:1, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
                         masked_exp[:, 0:1, :] = 0
                         cond = self.dnase_global[tissue_id]
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase_nofilm':
                         aux = label[:, 0:1, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
                         masked_exp[:, 0:1, :] = 0
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
+                    elif self.mode == 'corgiplus_impute':
+                        aux = mean_baseline
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg)
                     elif self.mode in ('corgi', 'corgi_finetune'):
                         outputs = self.model(dna_seq, trans_reg)
                     else:
@@ -432,8 +479,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         baseline_batch = mean_baseline.to(outputs.dtype)
                         baseline_crop = self.crop_tensor(baseline_batch, self.config['output_central_bins'])
                         outputs = outputs + baseline_crop
-
-                    outputs = torch.clamp(outputs, min=self.config.get('min_pred_value', 0.0))
+                        outputs = torch.clamp(outputs, min=self.config.get('min_pred_value', 0.0))
                     
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])
@@ -455,8 +501,10 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             dist.all_reduce(total_num, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_den, op=dist.ReduceOp.SUM)
 
-        if self.rank == 0 and total_den.item() > 0:
+        if total_den.item() > 0:
             val_loss = (total_num / total_den).item()
-            logging.info(f"Validation ({tag}) epoch {epoch} step {step}: loss={val_loss:.4f}")
+            if self.rank == 0:
+                logging.info(f"Validation ({tag}) epoch {epoch} step {step}: loss={val_loss:.4f}")
 
         self.model.train()
+        return val_loss if self.rank == 0 else None

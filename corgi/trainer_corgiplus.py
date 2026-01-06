@@ -114,15 +114,23 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
             cfg['corgiplus_aux_input_dim'] = 2
             if self.corgi_impute:
                 cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
-
+        elif self.mode == 'corgiplus_rna_nofilm':
+            cfg['corgiplus_aux_input_dim'] = 2
+            if self.corgi_impute:
+                cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
+        elif self.mode == 'corgiplusplus_rna':
+            # RNA tracks (2) + mean baseline (22) + RNA deltas (2)
+            cfg['corgiplus_aux_input_dim'] = cfg['output_channels'] + 4
         elif self.mode == 'corgiplus_impute':
             cfg['corgiplus_aux_input_dim'] = cfg['output_channels']
 
-        if self.mode in ('dnase', 'dnase_nofilm', 'rna', 'corgiplus_impute'):
+        if self.mode in ('dnase', 'dnase_nofilm', 'rna', 'corgiplus_impute', 'corgiplusplus_rna', 'corgiplus_rna_nofilm'):
             logging.info(f'Building CorgiPlus model for mode {self.mode} with aux input dim {cfg["corgiplus_aux_input_dim"]}')
 
-        if self.mode == 'rna':
+        if self.mode in ('rna', 'corgiplusplus_rna'):
             model = CorgiPlus(cfg)
+        elif self.mode == 'corgiplus_rna_nofilm':
+            model = CorgiPlusNofilm(cfg)
         elif self.mode == 'dnase':
             model = CorgiPlus(cfg)
         elif self.mode == 'dnase_nofilm':
@@ -318,7 +326,20 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         # In the imputation mode, we use the mean baseline of all channels as additional aux input
                         if self.corgi_impute:
                             aux = torch.cat([aux, mean_baseline], dim=1)
-                        # Turn off backprop from RNA channels: total rna, polyA, scRNA
+                        # Turn off backprop from RNA channels: total, polya, sc 
+                        masked_exp[:, 16:21, :] = 0
+                        cond = trans_reg
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
+                    elif self.mode == 'corgiplus_rna_nofilm':
+                        aux = label[:, 16:18, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
+                        masked_exp[:, 16:21, :] = 0
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
+                    elif self.mode == 'corgiplusplus_rna':
+                        rna_tracks = label[:, 16:18, :]
+                        delta_rna = rna_tracks - mean_baseline[:, 16:18, :]
+                        aux = torch.cat([rna_tracks, mean_baseline, delta_rna], dim=1)
                         masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
@@ -344,6 +365,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         raise ValueError(self.mode)
 
                     cropped_label = self.crop_tensor(label, cfg["output_central_bins"])
+                    baseline_crop = self.crop_tensor(mean_baseline, cfg['output_central_bins']).to(outputs.dtype)
 
                     # If predicting the residual, add the baseline signal across training tissues
                     if self.residual_training:
@@ -356,6 +378,14 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, poisson_loss_weight, loss_epsilon)
 
+                    # Add delta MSE loss for corgiplusplus_rna
+                    if self.mode == 'corgiplusplus_rna':
+                        mask_channels = exp_mask.to(outputs.dtype).squeeze(-1)
+                        pred_delta = outputs - baseline_crop
+                        true_delta = cropped_label - baseline_crop
+                        per_channel_mse = ((pred_delta - true_delta) ** 2).mean(dim=-1)
+                        delta_mse = (per_channel_mse * mask_channels).sum() / (mask_channels.sum() + 1e-8)
+
                     # Adaptive loss
                     model_ref = self.model.module if isinstance(self.model, DDP) else self.model
                     if hasattr(model_ref, 'loss_channel_weights'):
@@ -364,6 +394,9 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         loss = channel_losses.sum() / masked_exp.sum()
                     else:
                         loss = (channel_losses * masked_exp.squeeze(-1)).sum() / masked_exp.sum()
+
+                    if self.mode == 'corgiplusplus_rna':
+                        loss = loss + 10 * delta_mse
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['gradient_clipping'])
@@ -452,6 +485,19 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
+                    elif self.mode == 'corgiplus_rna_nofilm':
+                        aux = label[:, 16:18, :]
+                        if self.corgi_impute:
+                            aux = torch.cat([aux, mean_baseline], dim=1)
+                        masked_exp[:, 16:21, :] = 0
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
+                    elif self.mode == 'corgiplusplus_rna':
+                        rna_tracks = label[:, 16:18, :]
+                        delta_rna = rna_tracks - mean_baseline[:, 16:18, :]
+                        aux = torch.cat([rna_tracks, mean_baseline, delta_rna], dim=1)
+                        masked_exp[:, 16:21, :] = 0
+                        cond = trans_reg
+                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
                     elif self.mode == 'dnase':
                         aux = label[:, 0:1, :]
                         if self.corgi_impute:
@@ -474,6 +520,7 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         raise ValueError(self.mode)
 
                     cropped_label = self.crop_tensor(label, self.config["output_central_bins"])
+                    baseline_crop = self.crop_tensor(mean_baseline, self.config['output_central_bins']).to(outputs.dtype)
 
                     if self.residual_training:
                         baseline_batch = mean_baseline.to(outputs.dtype)
@@ -484,6 +531,13 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                     # Compute loss
                     channel_losses = poisson_multinomial_masked_v2(outputs, cropped_label, masked_exp, self.config['poisson_loss_weighting'] if self.config['loss_style'] in ['adaptive_mn'] else 1.0, self.config['loss_epsilon'])
 
+                    if self.mode == 'corgiplusplus_rna':
+                        mask_channels = exp_mask.to(outputs.dtype).squeeze(-1)
+                        pred_delta = outputs - baseline_crop
+                        true_delta = cropped_label - baseline_crop
+                        per_channel_mse = ((pred_delta - true_delta) ** 2).mean(dim=-1)
+                        delta_mse = 10 * (per_channel_mse * mask_channels).sum() / (mask_channels.sum() + 1e-8)
+
                     model_ref = self.model.module if isinstance(self.model, DDP) else self.model
                     if hasattr(model_ref, 'loss_channel_weights'):
                         weights = (1 / (2 * model_ref.loss_channel_weights ** 2))
@@ -493,6 +547,10 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
 
                     loss_num = channel_losses.sum()
                     loss_den = masked_exp.sum() + 1e-8
+
+                    if self.mode == 'corgiplusplus_rna':
+                        # Add delta MSE as an equally weighted term to the mean loss
+                        loss_num = loss_num + delta_mse * loss_den
 
                     total_num += loss_num
                     total_den += loss_den

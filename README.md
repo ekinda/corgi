@@ -4,7 +4,7 @@ Corgi is a deep neural network that predicts genomic sequencing tracks such as D
 
 See the following preprint for details:
 
-https://www.biorxiv.org/content/10.1101/2025.06.25.661447v1
+https://www.biorxiv.org/content/10.1101/2025.06.25.661447v2
 
 Model weights can be downloaded from: https://zenodo.org/records/18630048
 

@@ -32,12 +32,6 @@ Core Python dependencies:
 
 ### 3) Installation
 
-Package-install placeholder (name may change later):
-
-```bash
-pip install corgi
-```
-
 Install from source:
 
 ```bash

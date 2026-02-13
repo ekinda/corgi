@@ -21,7 +21,7 @@ from .utils import load_experiment_mask, poisson_multinomial_masked_v2
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 
 class CorgiPlusDataset(CorgiDataset):
-    """Return tissue ids alongside tensors for DNase conditioning."""
+    """Return tissue ids alongside tensors."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -98,19 +98,10 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         self.residual_training = cfg.get('residual_training', False)
         self.mean_baseline_file = cfg.get('baseline_path')
 
-        self.dnase_global = None
-        if self.mode in ("dnase", "dnase_nofilm"):
-            self.dnase_global = torch.from_numpy(np.load(cfg['dnase_global_path'])).float().to(self.device)
-
     def _build_model(self):
         cfg = dict(self.config)
 
-        if self.mode in ("dnase", "dnase_nofilm") and self.dnase_global is not None:
-            cfg['input_trans_regulators'] = self.dnase_global.shape[1]
-            cfg['corgiplus_aux_input_dim'] = 1
-            if self.corgi_impute:
-                cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
-        elif self.mode == 'rna':
+        if self.mode == 'rna':
             cfg['corgiplus_aux_input_dim'] = 2
             if self.corgi_impute:
                 cfg['corgiplus_aux_input_dim'] += cfg['output_channels']
@@ -124,16 +115,12 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
         elif self.mode == 'corgiplus_impute':
             cfg['corgiplus_aux_input_dim'] = cfg['output_channels']
 
-        if self.mode in ('dnase', 'dnase_nofilm', 'rna', 'corgiplus_impute', 'corgiplusplus_rna', 'corgiplus_rna_nofilm'):
+        if self.mode in ('rna', 'corgiplus_impute', 'corgiplusplus_rna', 'corgiplus_rna_nofilm'):
             logging.info(f'Building CorgiPlus model for mode {self.mode} with aux input dim {cfg["corgiplus_aux_input_dim"]}')
 
         if self.mode in ('rna', 'corgiplusplus_rna'):
             model = CorgiPlus(cfg)
         elif self.mode == 'corgiplus_rna_nofilm':
-            model = CorgiPlusNofilm(cfg)
-        elif self.mode == 'dnase':
-            model = CorgiPlus(cfg)
-        elif self.mode == 'dnase_nofilm':
             model = CorgiPlusNofilm(cfg)
         elif self.mode == 'corgiplus_impute':
             model = CorgiPlus(cfg)
@@ -343,19 +330,6 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
-                    elif self.mode == 'dnase':
-                        aux = label[:, 0:1, :]
-                        if self.corgi_impute:
-                            aux = torch.cat([aux, mean_baseline], dim=1)
-                        masked_exp[:, 0:1, :] = 0
-                        cond = self.dnase_global[tissue_id]
-                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
-                    elif self.mode == 'dnase_nofilm':
-                        aux = label[:, 0:1, :]
-                        if self.corgi_impute:
-                            aux = torch.cat([aux, mean_baseline], dim=1)
-                        masked_exp[:, 0:1, :] = 0
-                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
                     elif self.mode == 'corgiplus_impute':
                         aux = mean_baseline
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg)
@@ -498,19 +472,6 @@ class CorgiPlusTrainer(CorgiBaseTrainer):
                         masked_exp[:, 16:21, :] = 0
                         cond = trans_reg
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
-                    elif self.mode == 'dnase':
-                        aux = label[:, 0:1, :]
-                        if self.corgi_impute:
-                            aux = torch.cat([aux, mean_baseline], dim=1)
-                        masked_exp[:, 0:1, :] = 0
-                        cond = self.dnase_global[tissue_id]
-                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), cond)
-                    elif self.mode == 'dnase_nofilm':
-                        aux = label[:, 0:1, :]
-                        if self.corgi_impute:
-                            aux = torch.cat([aux, mean_baseline], dim=1)
-                        masked_exp[:, 0:1, :] = 0
-                        outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg=None)
                     elif self.mode == 'corgiplus_impute':
                         aux = mean_baseline
                         outputs = self.model(dna_seq, aux.permute(0, 2, 1), trans_reg)

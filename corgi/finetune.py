@@ -8,8 +8,7 @@ data generation pipeline:
 * A bulk RNA-seq profile provided as a :class:`pandas.Series` whose index lists
     gene symbols or Ensembl IDs.
 
-These artefacts are converted to the tensors that Corgi expects internally, so
-users do not need to generate intermediary ``.npy`` files ahead of time.
+CAUTION: This script is not tested yet.
 """
 
 from __future__ import annotations

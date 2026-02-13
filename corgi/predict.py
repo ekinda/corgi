@@ -1,20 +1,4 @@
-"""High-level inference helpers for the Corgi model.
-
-The functions in this module expose the three user-facing prediction entry
-points described in the packaging plan:
-
-1. `predict_sequence` runs Corgi on a single 524,288 bp DNA sequence using a
-   provided trans regulator expression profile.
-2. `predict_regions` iterates over genomic regions defined by a FASTA/BED pair
-   and stacks the predictions for each 524,288 bp window.
-3. `predict_regions_with_bigwig` mirrors (2) but also materialises one BigWig
-   file per track for convenient downstream browsing.
-
-All helpers share a common loading path that builds a model instance from a
-checkpoint, applies the same configuration that was used during pretraining,
-converts the user-provided trans regulator inputs into the fixed ordering that
-Corgi expects, and handles batching logic for efficiency.
-"""
+"""High-level inference helpers for pretrained Corgi-family models."""
 
 from __future__ import annotations
 
@@ -65,7 +49,7 @@ def _load_model(checkpoint_path: Union[str, Path], config: dict, device: torch.d
     model = Corgi(config)
     state = torch.load(checkpoint_path, map_location=device)
     weights = state.get("model_state_dict", state)
-    model.load_state_dict(weights, strict=True)
+    model.load_state_dict(weights, strict=False)
     model.to(device)
     model.eval()
     return model
@@ -140,8 +124,36 @@ def _predict_batch(
     batch_size = seq_tensor.size(0)
     trans_reg_batch = trans_reg_tensor.expand(batch_size, -1)
     with torch.no_grad():
-        outputs = model(seq_tensor, trans_reg_batch)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            outputs = model(seq_tensor, trans_reg_batch)
     return outputs.permute(0, 2, 1).cpu().numpy()
+
+
+def _resolve_output_channels(
+    output_channels: Optional[Sequence[Union[int, str]]],
+    track_names: Sequence[str],
+) -> Tuple[np.ndarray, Tuple[str, ...]]:
+    if output_channels is None:
+        indices = np.arange(len(track_names), dtype=np.int64)
+        names = tuple(track_names)
+        return indices, names
+
+    indices: List[int] = []
+    for channel in output_channels:
+        if isinstance(channel, int):
+            idx = channel
+        else:
+            if channel not in track_names:
+                raise ValueError(f"Unknown output channel name '{channel}'.")
+            idx = track_names.index(channel)
+        if idx < 0 or idx >= len(track_names):
+            raise ValueError(f"Output channel index {idx} is out of bounds for {len(track_names)} tracks.")
+        if idx not in indices:
+            indices.append(idx)
+
+    selected = np.asarray(indices, dtype=np.int64)
+    names = tuple(track_names[i] for i in selected)
+    return selected, names
 
 
 def _write_bigwig(
@@ -194,6 +206,134 @@ def _load_components(
     return model, resolved_device, cfg, names
 
 
+class corgi_pretrained:
+    """Inference wrapper for pretrained Corgi checkpoints."""
+
+    def __init__(
+        self,
+        checkpoint_path: Union[str, Path],
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        config: Optional[dict] = None,
+        output_channels: Optional[Sequence[Union[int, str]]] = None,
+    ):
+        self.model, self.device, self.config, all_track_names = _load_components(
+            checkpoint_path,
+            device,
+            config,
+            DEFAULT_TRACK_NAMES,
+        )
+        self.output_channel_indices, self.output_track_names = _resolve_output_channels(output_channels, all_track_names)
+
+    def _select_channels(self, prediction: np.ndarray) -> np.ndarray:
+        return prediction[:, self.output_channel_indices]
+
+    def predict(
+        self,
+        dna_sequence: Union[str, np.ndarray, torch.Tensor],
+        trans_regulator_expression: Union[np.ndarray, Sequence[float], pd.Series],
+    ) -> np.ndarray:
+        trans_reg_tensor = _prepare_trans_regulator_vector(trans_regulator_expression, self.config, self.device)
+        seq_array = _sequence_to_array(dna_sequence)
+        prediction = _predict_batch(self.model, [seq_array], trans_reg_tensor, self.device)[0]
+        return self._select_channels(prediction)
+
+    def predict_regions(
+        self,
+        fasta_path: Union[str, Path],
+        bed_path: Union[str, Path],
+        trans_regulator_expression: Union[np.ndarray, Sequence[float], pd.Series],
+        batch_size: int = 2,
+    ) -> np.ndarray:
+        trans_reg_tensor = _prepare_trans_regulator_vector(trans_regulator_expression, self.config, self.device)
+        fasta = Fasta(str(fasta_path))
+        regions = _enumerate_regions(bed_path)
+        sequences: List[np.ndarray] = []
+        predictions: List[np.ndarray] = []
+
+        for chrom, region_start, region_end in regions:
+            for window_start, window_end in _tile_region(region_start, region_end):
+                seq = fasta[chrom][window_start:window_end].seq
+                sequences.append(_sequence_to_array(seq))
+
+                if len(sequences) == batch_size:
+                    predictions.append(_predict_batch(self.model, sequences, trans_reg_tensor, self.device))
+                    sequences.clear()
+
+        if sequences:
+            predictions.append(_predict_batch(self.model, sequences, trans_reg_tensor, self.device))
+
+        if not predictions:
+            raise ValueError("No prediction windows produced from the supplied BED file.")
+        fasta.close()
+        stacked = np.concatenate(predictions, axis=0)
+        return stacked[:, :, self.output_channel_indices]
+
+    def predict_regions_with_bigwig(
+        self,
+        fasta_path: Union[str, Path],
+        bed_path: Union[str, Path],
+        trans_regulator_expression: Union[np.ndarray, Sequence[float], pd.Series],
+        batch_size: int = 2,
+        bigwig_dir: Union[str, Path] = "corgi_bigwig",
+        bigwig_prefix: str = "corgi",
+    ) -> np.ndarray:
+        trans_reg_tensor = _prepare_trans_regulator_vector(trans_regulator_expression, self.config, self.device)
+        fasta = Fasta(str(fasta_path))
+        regions = _enumerate_regions(bed_path)
+        windows: List[_Window] = []
+        sequences: List[np.ndarray] = []
+        predictions: List[np.ndarray] = []
+
+        for chrom, region_start, region_end in regions:
+            for window_start, window_end in _tile_region(region_start, region_end):
+                seq = fasta[chrom][window_start:window_end].seq
+                sequences.append(_sequence_to_array(seq))
+                windows.append(_Window(chrom, window_start, window_end))
+
+                if len(sequences) == batch_size:
+                    predictions.append(_predict_batch(self.model, sequences, trans_reg_tensor, self.device))
+                    sequences.clear()
+
+        if sequences:
+            predictions.append(_predict_batch(self.model, sequences, trans_reg_tensor, self.device))
+
+        if not predictions:
+            raise ValueError("No prediction windows produced from the supplied BED file.")
+
+        stacked = np.concatenate(predictions, axis=0)
+        selected = stacked[:, :, self.output_channel_indices]
+        _write_bigwig(selected, windows, fasta, self.output_track_names, bigwig_dir, bigwig_prefix)
+        fasta.close()
+        return selected
+
+
+class corgiplus_pretrained:
+    """Placeholder class for future Corgi+ pretrained inference support."""
+
+    def __init__(
+        self,
+        checkpoint_path: Union[str, Path],
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        config: Optional[dict] = None,
+        output_channels: Optional[Sequence[Union[int, str]]] = None,
+    ):
+        self.checkpoint_path = checkpoint_path
+        self.device = device
+        self.config = config
+        self.output_channels = output_channels
+
+    def predict(self, *args, **kwargs):
+        raise NotImplementedError("corgiplus_pretrained is a placeholder and will be implemented later.")
+
+    def predict_regions(self, *args, **kwargs):
+        raise NotImplementedError("corgiplus_pretrained is a placeholder and will be implemented later.")
+
+    def predict_regions_with_bigwig(self, *args, **kwargs):
+        raise NotImplementedError("corgiplus_pretrained is a placeholder and will be implemented later.")
+
+
 def predict_sequence(
     checkpoint_path: Union[str, Path],
     sequence: Union[str, np.ndarray, torch.Tensor],
@@ -201,12 +341,15 @@ def predict_sequence(
     *,
     device: Optional[Union[str, torch.device]] = None,
     config: Optional[dict] = None,
+    output_channels: Optional[Sequence[Union[int, str]]] = None,
 ) -> np.ndarray:
-    model, resolved_device, cfg, _ = _load_components(checkpoint_path, device, config, None)
-    trans_reg_tensor = _prepare_trans_regulator_vector(trans_reg_expression, cfg, resolved_device)
-    seq_array = _sequence_to_array(sequence)
-    prediction = _predict_batch(model, [seq_array], trans_reg_tensor, resolved_device)
-    return prediction[0]
+    predictor = corgi_pretrained(
+        checkpoint_path,
+        device=device,
+        config=config,
+        output_channels=output_channels,
+    )
+    return predictor.predict(sequence, trans_reg_expression)
 
 
 def predict_regions(
@@ -218,28 +361,15 @@ def predict_regions(
     device: Optional[Union[str, torch.device]] = None,
     config: Optional[dict] = None,
     batch_size: int = 2,
+    output_channels: Optional[Sequence[Union[int, str]]] = None,
 ) -> np.ndarray:
-    model, resolved_device, cfg, _ = _load_components(checkpoint_path, device, config, None)
-    trans_reg_tensor = _prepare_trans_regulator_vector(trans_reg_expression, cfg, resolved_device)
-    fasta = Fasta(str(fasta_path))
-    regions = _enumerate_regions(bed_path)
-    windows: List[_Window] = []
-    sequences: List[np.ndarray] = []
-    predictions: List[np.ndarray] = []
-    for chrom, region_start, region_end in regions:
-        for window_start, window_end in _tile_region(region_start, region_end):
-            seq = fasta[chrom][window_start:window_end].seq
-            sequences.append(_sequence_to_array(seq))
-            windows.append(_Window(chrom, window_start, window_end))
-            if len(sequences) == batch_size:
-                predictions.append(_predict_batch(model, sequences, trans_reg_tensor, resolved_device))
-                sequences.clear()
-    if sequences:
-        predictions.append(_predict_batch(model, sequences, trans_reg_tensor, resolved_device))
-    if not predictions:
-        raise ValueError("No prediction windows produced from the supplied BED file.")
-    fasta.close()
-    return np.concatenate(predictions, axis=0)
+    predictor = corgi_pretrained(
+        checkpoint_path,
+        device=device,
+        config=config,
+        output_channels=output_channels,
+    )
+    return predictor.predict_regions(fasta_path, bed_path, trans_reg_expression, batch_size=batch_size)
 
 
 def predict_regions_with_bigwig(
@@ -253,27 +383,19 @@ def predict_regions_with_bigwig(
     batch_size: int = 2,
     bigwig_dir: Union[str, Path] = "corgi_bigwig",
     bigwig_prefix: str = "corgi",
+    output_channels: Optional[Sequence[Union[int, str]]] = None,
 ) -> np.ndarray:
-    model, resolved_device, cfg, track_names = _load_components(checkpoint_path, device, config, None)
-    trans_reg_tensor = _prepare_trans_regulator_vector(trans_reg_expression, cfg, resolved_device)
-    fasta = Fasta(str(fasta_path))
-    regions = _enumerate_regions(bed_path)
-    windows: List[_Window] = []
-    sequences: List[np.ndarray] = []
-    predictions: List[np.ndarray] = []
-    for chrom, region_start, region_end in regions:
-        for window_start, window_end in _tile_region(region_start, region_end):
-            seq = fasta[chrom][window_start:window_end].seq
-            sequences.append(_sequence_to_array(seq))
-            windows.append(_Window(chrom, window_start, window_end))
-            if len(sequences) == batch_size:
-                predictions.append(_predict_batch(model, sequences, trans_reg_tensor, resolved_device))
-                sequences.clear()
-    if sequences:
-        predictions.append(_predict_batch(model, sequences, trans_reg_tensor, resolved_device))
-    if not predictions:
-        raise ValueError("No prediction windows produced from the supplied BED file.")
-    stacked = np.concatenate(predictions, axis=0)
-    _write_bigwig(stacked, windows, fasta, track_names, bigwig_dir, bigwig_prefix)
-    fasta.close()
-    return stacked
+    predictor = corgi_pretrained(
+        checkpoint_path,
+        device=device,
+        config=config,
+        output_channels=output_channels,
+    )
+    return predictor.predict_regions_with_bigwig(
+        fasta_path,
+        bed_path,
+        trans_reg_expression,
+        batch_size=batch_size,
+        bigwig_dir=bigwig_dir,
+        bigwig_prefix=bigwig_prefix,
+    )

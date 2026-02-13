@@ -1,2 +1,3 @@
 data/corgi_model.pt
 corgi/__pycache__/
+*egg-info/

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,9 @@ _DNA_TO_INDEX[ord("A")] = 0
 _DNA_TO_INDEX[ord("C")] = 1
 _DNA_TO_INDEX[ord("G")] = 2
 _DNA_TO_INDEX[ord("T")] = 3
+
+_DEFAULT_TF_REFERENCE_PATH = Path(__file__).resolve().parents[1] / "data" / "tf_reference.npy"
+_TF_REFERENCE_CACHE: Dict[str, np.ndarray] = {}
 
 
 @dataclass
@@ -55,13 +58,48 @@ def _load_model(checkpoint_path: Union[str, Path], config: dict, device: torch.d
     return model
 
 
+def quantile_normalize_trans_reg_expression(expression: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Quantile-normalize a trans-regulator vector to a reference distribution."""
+    expr = np.asarray(expression, dtype=np.float32)
+    ref = np.asarray(reference, dtype=np.float32)
+    if expr.ndim != 1:
+        raise ValueError(f"Expected 1D expression vector, received shape {expr.shape}.")
+    if ref.ndim != 1:
+        raise ValueError(f"Expected 1D reference vector, received shape {ref.shape}.")
+    if expr.shape[0] != ref.shape[0]:
+        raise ValueError(
+            f"Expression/reference length mismatch: {expr.shape[0]} vs {ref.shape[0]}."
+        )
+
+    order = np.argsort(expr, kind="mergesort")
+    ref_sorted = np.sort(ref)
+    normalized = np.empty_like(expr, dtype=np.float32)
+    normalized[order] = ref_sorted
+    return normalized
+
+
+def _load_tf_reference(config: dict) -> np.ndarray:
+    reference_path = Path(config.get("tf_reference_path", _DEFAULT_TF_REFERENCE_PATH)).resolve()
+    cache_key = str(reference_path)
+    if cache_key not in _TF_REFERENCE_CACHE:
+        if not reference_path.exists():
+            raise FileNotFoundError(
+                f"TF reference file not found at {reference_path}. "
+                "Set config['tf_reference_path'] to override the default."
+            )
+        _TF_REFERENCE_CACHE[cache_key] = np.load(reference_path).astype(np.float32, copy=False)
+    return _TF_REFERENCE_CACHE[cache_key]
+
+
 def _prepare_trans_regulator_vector(
     expression: Union[np.ndarray, Sequence[float], pd.Series],
     config: dict,
     device: torch.device,
 ) -> torch.Tensor:
     ordered = encode_trans_reg_expression(expression, config)
-    tensor = torch.from_numpy(ordered)
+    reference = _load_tf_reference(config)
+    normalized = quantile_normalize_trans_reg_expression(ordered, reference)
+    tensor = torch.from_numpy(normalized)
     return tensor.to(device).unsqueeze(0)
 
 
@@ -159,13 +197,24 @@ def _resolve_output_channels(
 def _write_bigwig(
     predictions: np.ndarray,
     windows: Sequence[_Window],
-    fasta: Fasta,
+    chrom_sizes_path: Union[str, Path],
     track_names: Sequence[str],
     output_dir: Union[str, Path],
     prefix: str,
 ) -> None:
-    chrom_sizes = {name: entry.len for name, entry in fasta.faidx.items()}
-    header = [(chrom, size) for chrom, size in chrom_sizes.items()]
+    header: List[Tuple[str, int]] = []
+    with Path(chrom_sizes_path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            chrom, size_str, *_ = line.rstrip().split("\t")
+            header.append((chrom, int(size_str)))
+    if not header:
+        raise ValueError(f"No chromosome entries found in chrom.sizes file: {chrom_sizes_path}")
+
+    chrom_size_map: Dict[str, int] = dict(header)
+    chrom_rank: Dict[str, int] = {chrom: i for i, (chrom, _) in enumerate(header)}
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     writers = []
@@ -174,18 +223,48 @@ def _write_bigwig(
         writer = pyBigWig.open(str(path), "w")
         writer.addHeader(header)
         writers.append(writer)
+
+    write_order = sorted(
+        range(len(windows)),
+        key=lambda i: (chrom_rank.get(windows[i].chrom, len(chrom_rank)), windows[i].central_start),
+    )
+
+    last_start_by_writer: List[Dict[str, int]] = [{chrom: -1 for chrom in chrom_size_map} for _ in writers]
     try:
-        for pred, window in zip(predictions, windows):
+        for idx in write_order:
+            pred = predictions[idx]
+            window = windows[idx]
             starts = window.central_start + np.arange(CENTRAL_BINS) * BIN_SIZE
             ends = starts + BIN_SIZE
             chrom = window.chrom
+            chrom_size = chrom_size_map.get(chrom)
+            if chrom_size is None:
+                continue
+
+            valid = (starts >= 0) & (ends <= chrom_size) & (starts < ends)
+            if not np.any(valid):
+                continue
+
+            starts_v = starts[valid]
+            ends_v = ends[valid]
+
             for track_idx, writer in enumerate(writers):
+                values_v = pred[valid, track_idx].astype(float)
+                last_start = last_start_by_writer[track_idx][chrom]
+                increasing = starts_v > last_start
+                if not np.any(increasing):
+                    continue
+
+                starts_i = starts_v[increasing]
+                ends_i = ends_v[increasing]
+                values_i = values_v[increasing]
                 writer.addEntries(
-                    [chrom] * CENTRAL_BINS,
-                    starts.tolist(),
-                    ends.tolist(),
-                    pred[:, track_idx].astype(float).tolist(),
+                    [chrom] * len(starts_i),
+                    starts_i.tolist(),
+                    ends_i.tolist(),
+                    values_i.tolist(),
                 )
+                last_start_by_writer[track_idx][chrom] = int(starts_i[-1])
     finally:
         for writer in writers:
             writer.close()
@@ -273,6 +352,7 @@ class corgi_pretrained:
         self,
         fasta_path: Union[str, Path],
         bed_path: Union[str, Path],
+        chrom_sizes_path: Union[str, Path],
         trans_regulator_expression: Union[np.ndarray, Sequence[float], pd.Series],
         batch_size: int = 2,
         bigwig_dir: Union[str, Path] = "corgi_bigwig",
@@ -303,7 +383,7 @@ class corgi_pretrained:
 
         stacked = np.concatenate(predictions, axis=0)
         selected = stacked[:, :, self.output_channel_indices]
-        _write_bigwig(selected, windows, fasta, self.output_track_names, bigwig_dir, bigwig_prefix)
+        _write_bigwig(selected, windows, chrom_sizes_path, self.output_track_names, bigwig_dir, bigwig_prefix)
         fasta.close()
         return selected
 
@@ -376,6 +456,7 @@ def predict_regions_with_bigwig(
     checkpoint_path: Union[str, Path],
     fasta_path: Union[str, Path],
     bed_path: Union[str, Path],
+    chrom_sizes_path: Union[str, Path],
     trans_reg_expression: Union[np.ndarray, Sequence[float], pd.Series],
     *,
     device: Optional[Union[str, torch.device]] = None,
@@ -394,6 +475,7 @@ def predict_regions_with_bigwig(
     return predictor.predict_regions_with_bigwig(
         fasta_path,
         bed_path,
+        chrom_sizes_path,
         trans_reg_expression,
         batch_size=batch_size,
         bigwig_dir=bigwig_dir,

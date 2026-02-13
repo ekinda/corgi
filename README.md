@@ -6,7 +6,7 @@ See the following preprint for details:
 
 https://www.biorxiv.org/content/10.1101/2025.06.25.661447v1
 
-Model weights can be downloaded from: https://zenodo.org/records/17368602
+Model weights can be downloaded from: https://zenodo.org/records/18630048
 
 ## Tutorial
 
@@ -17,7 +17,7 @@ Model weights can be downloaded from: https://zenodo.org/records/17368602
 - NVIDIA GPU with **Ampere or newer** architecture (A100, RTX 30xx, RTX 40xx, H100, etc.)
 - CUDA-enabled PyTorch installation compatible with your driver
 
-> Why Ampere+? Corgi uses FlashAttention v2 rotary positional encodings and bfloat16 autocast for fast inference. Older GPUs are not supported for the intended inference path.
+> Why Ampere+? Corgi uses FlashAttention v2 which currently does not support older GPUs.
 
 ### 2) Package requirements
 
@@ -54,7 +54,8 @@ pip install -e .
 
 ### 4) Download checkpoints
 
-- Corgi checkpoint: https://zenodo.org/records/17368602
+- Corgi checkpoint: https://zenodo.org/records/18630048/files/corgi_model.pt?download=1
+- Corgi+ checkpoint: https://zenodo.org/records/18630048/files/corgiplus_model.pt?download=1
 
 ### 5) Quick single-sequence inference
 
@@ -67,6 +68,8 @@ dna_sequence = "A" * 524_288
 
 # Trans-regulator expression in expected Corgi order (length 2891),
 # or a pandas Series indexed by HGNC/ENSG symbols.
+# Input is automatically quantile-normalized to the package reference
+# distribution in data/tf_reference.npy.
 trans_reg = np.zeros(2891, dtype=np.float32)
 
 model = corgi_pretrained(
@@ -114,3 +117,12 @@ This writes one BigWig file per selected output channel.
 - list of names, e.g. `["dnase", "ctcf", "rna_10x"]`
 
 Returned tensors and BigWig outputs will follow only those selected channels.
+
+### 9) Minimal region test scripts
+
+Included scripts:
+
+- [scripts/test_pretrained_predict_regions.py](scripts/test_pretrained_predict_regions.py)
+- [scripts/test_pretrained_predict_regions_bigwig.py](scripts/test_pretrained_predict_regions_bigwig.py)
+
+Both use a simple BED file at [data/test_predict_regions.bed](data/test_predict_regions.bed) and generate a temporary FASTA with `chrTest` for quick smoke testing.
